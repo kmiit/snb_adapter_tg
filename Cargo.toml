@@ -1,0 +1,15 @@
+[package]
+name = "snb_adapter_tg"
+edition = "2024"
+version = "0.0.1"
+authors = ["kmiit <kmiit@foxmail.com>"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+teloxide = "0.17"
+anyhow = "1"
+snb_core = { path = "../../crates/snb_core" }
+snb_macros = { path = "../../crates/snb_macros" }
+tokio = { version = "1", features = ["sync", "time", "rt"] }
