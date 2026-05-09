@@ -184,7 +184,9 @@ fn convert_message(msg: &teloxide::types::Message) -> Option<Event> {
                     args: args.to_string(),
                 });
             }
-            _ => {}
+            _ => {
+                log::debug!("Unresolved message entity kind: {:?}", entity.kind());
+            }
         }
     }
 
