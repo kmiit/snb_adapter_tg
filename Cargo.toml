@@ -10,6 +10,9 @@ crate-type = ["cdylib"]
 [dependencies]
 teloxide = "0.17"
 anyhow = "1"
+log = { workspace = true }
+serde = { version = "1", features = ["derive"] }
+toml = "1"
 snb_core = { path = "../../crates/snb_core" }
 snb_macros = { path = "../../crates/snb_macros" }
 tokio = { version = "1", features = ["sync", "time", "rt"] }
