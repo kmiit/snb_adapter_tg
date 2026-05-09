@@ -8,7 +8,7 @@ use snb_core::event::{ChatType, ContentItem, Event, Message};
 use snb_core::plugin::{PluginType, SnbPlugin, Version};
 use snb_macros::plugin;
 use teloxide::prelude::*;
-use teloxide::types::{ChatKind, MessageEntityKind, PublicChatKind, ReplyParameters};
+use teloxide::types::{ChatKind, MessageEntityKind, PublicChatKind, ReplyParameters, UpdateKind};
 
 #[derive(Deserialize)]
 struct Config {
@@ -127,8 +127,8 @@ impl Adapter for TGAdapter {
         bot.logger().info("TGAdapter", "start Telegram dispatcher");
 
         run_async(async move {
-            let handler = |msg: teloxide::types::Message, bot_ctx: Arc<dyn BotContext>| async move {
-                if let Some(event) = convert_message(&msg) {
+            let handler = |update: Update, bot_ctx: Arc<dyn BotContext>| async move {
+                if let Some(event) = convert_update(&update) {
                     bot_ctx.emit_event(event);
                 }
                 respond(())
@@ -136,7 +136,7 @@ impl Adapter for TGAdapter {
 
             let mut dispatcher = Dispatcher::builder(
                 tg_bot,
-                Update::filter_message().branch(dptree::endpoint(handler)),
+                dptree::entry().branch(dptree::endpoint(handler)),
             )
             .dependencies(dptree::deps![bot.clone()])
             .build();
@@ -146,9 +146,63 @@ impl Adapter for TGAdapter {
     }
 }
 
-fn convert_message(msg: &teloxide::types::Message) -> Option<Event> {
-    let text = msg.text().or(msg.caption())?;
-    let content = vec![ContentItem::Text(text.to_string())];
+fn convert_update(update: &Update) -> Option<Event> {
+    match &update.kind {
+        UpdateKind::Message(msg)
+        | UpdateKind::EditedMessage(msg)
+        | UpdateKind::ChannelPost(msg)
+        | UpdateKind::EditedChannelPost(msg)
+        | UpdateKind::BusinessMessage(msg)
+        | UpdateKind::EditedBusinessMessage(msg) => convert_message(update, msg),
+
+        kind => {
+            let kind_name = match kind {
+                UpdateKind::Message(_) => unreachable!(),
+                UpdateKind::EditedMessage(_) => unreachable!(),
+                UpdateKind::ChannelPost(_) => unreachable!(),
+                UpdateKind::EditedChannelPost(_) => unreachable!(),
+                UpdateKind::BusinessMessage(_) => unreachable!(),
+                UpdateKind::EditedBusinessMessage(_) => unreachable!(),
+                UpdateKind::BusinessConnection(_) => "BusinessConnection",
+                UpdateKind::DeletedBusinessMessages(_) => "DeletedBusinessMessages",
+                UpdateKind::MessageReaction(_) => "MessageReaction",
+                UpdateKind::MessageReactionCount(_) => "MessageReactionCount",
+                UpdateKind::InlineQuery(_) => "InlineQuery",
+                UpdateKind::ChosenInlineResult(_) => "ChosenInlineResult",
+                UpdateKind::CallbackQuery(_) => "CallbackQuery",
+                UpdateKind::ShippingQuery(_) => "ShippingQuery",
+                UpdateKind::PreCheckoutQuery(_) => "PreCheckoutQuery",
+                UpdateKind::PurchasedPaidMedia(_) => "PurchasedPaidMedia",
+                UpdateKind::Poll(_) => "Poll",
+                UpdateKind::PollAnswer(_) => "PollAnswer",
+                UpdateKind::MyChatMember(_) => "MyChatMember",
+                UpdateKind::ChatMember(_) => "ChatMember",
+                UpdateKind::ChatJoinRequest(_) => "ChatJoinRequest",
+                UpdateKind::ChatBoost(_) => "ChatBoost",
+                UpdateKind::RemovedChatBoost(_) => "RemovedChatBoost",
+                UpdateKind::Error(_) => "Error",
+            };
+            let data = serde_json::to_string(kind).unwrap_or_default();
+            Some(Event {
+                event_type: snb_core::event::EventType::Other(kind_name.to_string()),
+                source: "tg-adapter".to_string(),
+                data,
+                command: None,
+                message: None,
+                sender: Some("TGAdapter".to_string()),
+                receiver: None,
+            })
+        }
+    }
+}
+
+fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Event> {
+    let text = msg.text().or(msg.caption()).unwrap_or("");
+    let content = if text.is_empty() {
+        vec![]
+    } else {
+        vec![ContentItem::Text(text.to_string())]
+    };
 
     let from = msg.from.as_ref().map(|u| u.id.0.to_string());
     let chat_id = msg.chat.id.0.to_string();
@@ -213,9 +267,23 @@ fn convert_message(msg: &teloxide::types::Message) -> Option<Event> {
         chat_type: Some(chat_type),
     };
 
+    let kind_name = match &update.kind {
+        UpdateKind::Message(_) => "Message",
+        UpdateKind::EditedMessage(_) => "EditedMessage",
+        UpdateKind::ChannelPost(_) => "ChannelPost",
+        UpdateKind::EditedChannelPost(_) => "EditedChannelPost",
+        UpdateKind::BusinessMessage(_) => "BusinessMessage",
+        UpdateKind::EditedBusinessMessage(_) => "EditedBusinessMessage",
+        _ => unreachable!(),
+    };
+
     let (event_type, command, message) = match command {
         Some(cmd) => (snb_core::event::EventType::Command, Some(cmd), Some(event_msg)),
-        None => (snb_core::event::EventType::Message, None, Some(event_msg)),
+        None => (
+            snb_core::event::EventType::Other(kind_name.to_string()),
+            None,
+            Some(event_msg),
+        ),
     };
 
     Some(Event {
