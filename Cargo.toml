@@ -1,19 +1,24 @@
 [package]
 name = "snb_adapter_tg"
-edition = "2024"
-version = "0.0.1"
-authors = ["kmiit <kmiit@foxmail.com>"]
+version.workspace = true
+authors.workspace = true
+license.workspace = true
+readme.workspace = true
+homepage.workspace = true
+repository.workspace = true
+edition.workspace = true
+rust-version.workspace = true
 
 [lib]
 crate-type = ["cdylib"]
 
 [dependencies]
-teloxide = "0.17"
-anyhow = "1"
+anyhow = { workspace = true }
 log = { workspace = true }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-toml = "1"
-snb_core = { path = "../../crates/snb_core" }
-snb_macros = { path = "../../crates/snb_macros" }
+snb_core = { workspace = true }
+snb_macros = { workspace = true }
+teloxide = "0"
 tokio = { version = "1", features = ["sync", "time", "rt"] }
+toml = { workspace = true }

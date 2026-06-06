@@ -1,18 +1,24 @@
+//! Telegram adapter for the Shinobu bot framework.
+//!
+//! Connects to the Telegram Bot API via [`teloxide`] and converts incoming
+//! updates into [`Event`](snb_core::event::Event)s. Requires a bot token
+//! configured in `configs/TGAdapter/config.toml`.
+
 use std::path::Path;
-use std::sync::{Arc, OnceLock};
+use std::sync::{Arc, RwLock};
 
 use serde::Deserialize;
-use snb_core::adapter::{run_async, Adapter};
-use snb_core::context::{self, BotContext, PluginHelper};
+use snb_core::context::{self, BotContext};
 use snb_core::event::{ChatType, ContentItem, Event, Message};
 use snb_core::plugin::{PluginType, SnbPlugin, Version};
-use snb_macros::plugin;
+use snb_macros::{adapter, plugin};
 use teloxide::prelude::*;
 use teloxide::types::{ChatKind, MessageEntityKind, PublicChatKind, ReplyParameters, UpdateKind};
 
 #[derive(Deserialize)]
 struct Config {
     bot_token: String,
+    #[allow(dead_code)]
     api_url: Option<String>,
 }
 
@@ -21,21 +27,19 @@ bot_token = "YOUR_BOT_TOKEN_HERE"
 # api_url = "https://api.telegram.org"
 "#;
 
-#[derive(Clone)]
+// Plugin-wide state. Each plugin is a singleton (one cdylib, one instance), so
+// module-level globals mirror the framework's own `context::set_bot` pattern and
+// let the stateless `#[adapter]` function and `on_event` share the same data.
+// `RwLock<Option<_>>` (not `OnceLock`) so `on_unload` can reset it for reloads.
+static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
+static TG_BOT: RwLock<Option<Bot>> = RwLock::new(None);
+
 #[plugin]
-struct TGAdapter {
-    bot_token: Option<String>,
-    api_url: Option<String>,
-    bot: Arc<OnceLock<Bot>>,
-}
+struct TGAdapter;
 
 impl SnbPlugin for TGAdapter {
     fn new() -> Self {
-        Self {
-            bot_token: None,
-            api_url: None,
-            bot: Arc::new(OnceLock::new()),
-        }
+        Self
     }
     fn name(&self) -> &str {
         "TGAdapter"
@@ -52,32 +56,35 @@ impl SnbPlugin for TGAdapter {
     }
     fn on_load(&mut self, ctx: Arc<dyn BotContext>) {
         context::set_bot(ctx);
-        let name = self.name().to_string();
-        let p = PluginHelper::for_plugin(&name);
         let config_path = Path::new("TGAdapter/config.toml");
 
-        match p.load_config(config_path) {
+        match context::bot().load_config(config_path) {
             Ok(content) => match toml::from_str::<Config>(&content) {
                 Ok(config) => {
-                    self.bot_token = Some(config.bot_token);
-                    self.api_url = config.api_url;
+                    *CONFIG.write().unwrap() = Some(config);
                 }
                 Err(e) => {
-                    p.error(&format!("failed to parse config: {e}"));
+                    log::error!("failed to parse config: {e}");
                 }
             },
             Err(_) => {
-                if let Err(e) = p.write_config(Path::new("config.toml"), DEFAULT_CONFIG) {
-                    p.error(&format!("failed to write default config: {e}"));
+                if let Err(e) =
+                    context::bot().write_config(self.name(), Path::new("config.toml"), DEFAULT_CONFIG)
+                {
+                    log::error!("failed to write default config: {e}");
                 }
-                p.warn("config not found, default config written to configs/TGAdapter/config.toml, please edit it with your bot token");
+                log::warn!(
+                    "config not found, default config written to configs/TGAdapter/config.toml, please edit it with your bot token"
+                );
             }
         }
 
-        p.register_adapter(self.clone());
-        p.info(&format!("v{} loaded!", self.version()));
+        context::register_all(self.name());
+        log::info!("v{} loaded!", self.version());
     }
     fn on_unload(&mut self) {
+        *TG_BOT.write().unwrap() = None;
+        *CONFIG.write().unwrap() = None;
         log::info!("unloaded!");
     }
 
@@ -87,14 +94,20 @@ impl SnbPlugin for TGAdapter {
         }
         let Some(msg) = &event.message else { return };
         let text = msg.text();
-        if text.is_empty() { return; }
+        if text.is_empty() {
+            return;
+        }
         let Some(chat_id_str) = &msg.to else { return };
-        let Ok(chat_id) = chat_id_str.parse::<i64>() else { return };
-        let Some(bot) = self.bot.get() else {
-            log::error!("TGAdapter bot not initialized");
+        let Ok(chat_id) = chat_id_str.parse::<i64>() else {
             return;
         };
-        let bot = bot.clone();
+        let bot = match TG_BOT.read().unwrap().as_ref() {
+            Some(b) => b.clone(),
+            None => {
+                log::error!("TGAdapter bot not initialized");
+                return;
+            }
+        };
         let reply_to = msg.reply_to.clone();
         tokio::task::spawn(async move {
             let mut req = bot.send_message(ChatId(chat_id), text);
@@ -113,37 +126,34 @@ impl SnbPlugin for TGAdapter {
     }
 }
 
-impl Adapter for TGAdapter {
-    fn run(&self, bot: Arc<dyn BotContext>) {
-        let Some(token) = &self.bot_token else {
-            bot.logger()
-                .error("TGAdapter", "bot_token not configured, adapter not starting");
+#[adapter]
+async fn tg_dispatcher(bot: Arc<dyn BotContext>) {
+    let token = match CONFIG.read().unwrap().as_ref() {
+        Some(config) => config.bot_token.clone(),
+        None => {
+            log::error!("bot_token not configured, adapter not starting");
             return;
-        };
+        }
+    };
 
-        let tg_bot = Bot::new(token);
-        let _ = self.bot.set(tg_bot.clone());
+    let tg_bot = Bot::new(token);
+    *TG_BOT.write().unwrap() = Some(tg_bot.clone());
 
-        bot.logger().info("TGAdapter", "start Telegram dispatcher");
+    log::info!("start Telegram dispatcher");
 
-        run_async(async move {
-            let handler = |update: Update, bot_ctx: Arc<dyn BotContext>| async move {
-                if let Some(event) = convert_update(&update) {
-                    bot_ctx.emit_event(event);
-                }
-                respond(())
-            };
+    let handler = |update: Update, bot_ctx: Arc<dyn BotContext>| async move {
+        if let Some(event) = convert_update(&update) {
+            bot_ctx.emit_event(event);
+        }
+        respond(())
+    };
 
-            let mut dispatcher = Dispatcher::builder(
-                tg_bot,
-                dptree::entry().branch(dptree::endpoint(handler)),
-            )
+    let mut dispatcher =
+        Dispatcher::builder(tg_bot, dptree::entry().branch(dptree::endpoint(handler)))
             .dependencies(dptree::deps![bot.clone()])
             .build();
 
-            dispatcher.dispatch().await;
-        });
-    }
+    dispatcher.dispatch().await;
 }
 
 fn convert_update(update: &Update) -> Option<Event> {
@@ -278,12 +288,12 @@ fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Ev
     };
 
     let (event_type, command, message) = match command {
-        Some(cmd) => (snb_core::event::EventType::Command, Some(cmd), Some(event_msg)),
-        None => (
-            snb_core::event::EventType::Message,
-            None,
+        Some(cmd) => (
+            snb_core::event::EventType::Command,
+            Some(cmd),
             Some(event_msg),
         ),
+        None => (snb_core::event::EventType::Message, None, Some(event_msg)),
     };
 
     Some(Event {
