@@ -4,21 +4,25 @@
 //! updates into [`Event`](snb_core::event::Event)s. Requires a bot token
 //! configured in `configs/TGAdapter/config.toml`.
 
+use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, LazyLock, RwLock};
 
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose};
 use serde::Deserialize;
 use snb_core::adapter::{Adapter, run_async};
 use snb_core::context::{self, BotContext};
-use snb_core::event::{ChatType, ContentItem, Event, FileSource, ImageSource, Message};
+use snb_core::event::{
+    ChatType, ContentItem, Event, EventType, FileSource, ImageSource, Message, TextFormat,
+};
 use snb_core::plugin::{PluginType, SnbPlugin, Version};
 use snb_macros::plugin;
 use teloxide::prelude::*;
 use teloxide::types::{
-    ChatKind, FileId, InputFile, MessageEntityKind, PublicChatKind, ReplyParameters, UpdateKind,
+    ChatKind, FileId, InputFile, InputMedia, InputMediaDocument, MessageEntityKind, MessageId,
+    ParseMode, PublicChatKind, ReplyParameters, UpdateKind,
 };
 
 #[derive(Deserialize)]
@@ -39,6 +43,8 @@ bot_token = "YOUR_BOT_TOKEN_HERE"
 // `RwLock<Option<_>>` (not `OnceLock`) so `on_unload` can reset it for reloads.
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 static TG_BOT: RwLock<Option<Bot>> = RwLock::new(None);
+static SENT_MESSAGES: LazyLock<RwLock<HashMap<(i64, String), MessageId>>> =
+    LazyLock::new(|| RwLock::new(HashMap::new()));
 
 #[plugin]
 struct TGAdapter;
@@ -183,10 +189,15 @@ impl Adapter for TelegramAdapter {
             .as_ref()
             .cloned()
             .context("TGAdapter bot not initialized")?;
+        let event_type = event.event_type.clone();
         let msg = msg.clone();
 
         spawn_send_task(async move {
-            send_message_items(bot, chat_id, msg).await;
+            match event_type {
+                EventType::Message => send_message_items(bot, chat_id, msg).await,
+                EventType::MessageDelete => delete_message_item(bot, chat_id, msg).await,
+                kind => log::debug!("TGAdapter ignored outgoing event type: {kind:?}"),
+            }
         });
 
         Ok(())
@@ -211,68 +222,408 @@ where
 }
 
 async fn send_message_items(bot: Bot, chat_id: i64, msg: Message) {
+    let local_id = msg.id;
     let reply_to = msg.reply_to;
+    let mut text = OutgoingText::default();
+    let mut attachments = Vec::new();
+
     for item in msg.content {
         match item {
-            ContentItem::Text(text) => {
-                if text.is_empty() {
-                    continue;
-                }
-                let mut req = bot.send_message(ChatId(chat_id), text);
-                if let Some(reply) = reply_parameters(reply_to.as_deref()) {
-                    req = req.reply_parameters(reply);
-                }
-                if let Err(e) = req.await {
-                    log::error!("TGAdapter send_message error: {e}");
-                }
+            ContentItem::Text {
+                text: item_text,
+                format,
+            } => text.push_text(item_text, format),
+            ContentItem::File { .. } | ContentItem::Image { .. } => attachments.push(item),
+            ContentItem::Other { kind, .. } => {
+                log::debug!("TGAdapter ignored unsupported outgoing content kind: {kind}");
             }
+        }
+    }
+
+    let caption = text.into_payload();
+    if attachments.is_empty() {
+        if let Some(text) = caption {
+            send_text(
+                &bot,
+                chat_id,
+                text,
+                reply_to.as_deref(),
+                local_id.as_deref(),
+            )
+            .await;
+        }
+        return;
+    }
+
+    if attachments.len() > 1
+        && attachments
+            .iter()
+            .all(|item| matches!(item, ContentItem::File { .. }))
+    {
+        send_file_media_groups(
+            &bot,
+            chat_id,
+            attachments,
+            caption,
+            reply_to.as_deref(),
+            local_id.as_deref(),
+        )
+        .await;
+        return;
+    }
+
+    let mut first_caption = caption;
+    for item in attachments {
+        match item {
             ContentItem::File {
                 source,
                 file_name,
                 file_id,
             } => {
-                let input = match input_file_from_source(source, file_name, file_id) {
-                    Ok(input) => input,
-                    Err(e) => {
-                        log::error!("TGAdapter cannot prepare file: {e:#}");
-                        continue;
-                    }
-                };
-                let mut req = bot.send_document(ChatId(chat_id), input);
-                if let Some(reply) = reply_parameters(reply_to.as_deref()) {
-                    req = req.reply_parameters(reply);
-                }
-                if let Err(e) = req.await {
-                    log::error!("TGAdapter send_document error: {e}");
-                }
+                send_file(
+                    &bot,
+                    chat_id,
+                    source,
+                    file_name,
+                    file_id,
+                    first_caption.take(),
+                    reply_to.as_deref(),
+                    local_id.as_deref(),
+                )
+                .await;
             }
             ContentItem::Image {
                 source,
                 file_id,
                 caption,
             } => {
-                let input = match input_file_from_image(source, file_id) {
-                    Ok(input) => input,
-                    Err(e) => {
-                        log::error!("TGAdapter cannot prepare image: {e:#}");
-                        continue;
-                    }
-                };
-                let mut req = bot.send_photo(ChatId(chat_id), input);
-                if let Some(caption) = caption.filter(|caption| !caption.is_empty()) {
-                    req = req.caption(caption);
-                }
-                if let Some(reply) = reply_parameters(reply_to.as_deref()) {
-                    req = req.reply_parameters(reply);
-                }
-                if let Err(e) = req.await {
-                    log::error!("TGAdapter send_photo error: {e}");
+                let caption = merge_captions(first_caption.take(), caption);
+                send_image(
+                    &bot,
+                    chat_id,
+                    source,
+                    file_id,
+                    caption,
+                    reply_to.as_deref(),
+                    local_id.as_deref(),
+                )
+                .await;
+            }
+            ContentItem::Text { .. } | ContentItem::Other { .. } => unreachable!(),
+        }
+    }
+}
+
+#[derive(Default)]
+struct OutgoingText {
+    text: String,
+    format: Option<TextFormat>,
+    has_plain: bool,
+    mixed_formats: bool,
+}
+
+#[derive(Clone)]
+struct FormattedPayload {
+    text: String,
+    format: Option<TextFormat>,
+}
+
+impl OutgoingText {
+    fn push_text(&mut self, text: String, format: Option<TextFormat>) {
+        self.push(text, format);
+    }
+
+    fn push(&mut self, text: String, format: Option<TextFormat>) {
+        if text.is_empty() {
+            return;
+        }
+
+        match format {
+            Some(format) if !self.has_plain => {
+                if let Some(existing) = self.format {
+                    self.mixed_formats |= existing != format;
+                } else {
+                    self.format = Some(format);
                 }
             }
-            ContentItem::Other { kind, .. } => {
-                log::debug!("TGAdapter ignored unsupported outgoing content kind: {kind}");
+            Some(_) => {
+                self.mixed_formats = true;
+            }
+            None => {
+                if self.format.is_some() {
+                    self.mixed_formats = true;
+                }
+                self.has_plain = true;
             }
         }
+
+        self.text.push_str(&text);
+    }
+
+    fn into_payload(self) -> Option<FormattedPayload> {
+        (!self.text.is_empty()).then_some(FormattedPayload {
+            text: self.text,
+            format: (!self.mixed_formats && !self.has_plain)
+                .then_some(self.format)
+                .flatten(),
+        })
+    }
+}
+
+async fn send_text(
+    bot: &Bot,
+    chat_id: i64,
+    text: FormattedPayload,
+    reply_to: Option<&str>,
+    local_id: Option<&str>,
+) {
+    let mut req = bot.send_message(ChatId(chat_id), text.text);
+    if let Some(parse_mode) = text.format.map(parse_mode_from_format) {
+        req = req.parse_mode(parse_mode);
+    }
+    if let Some(reply) = reply_parameters(reply_to) {
+        req = req.reply_parameters(reply);
+    }
+    match req.await {
+        Ok(sent) => record_sent_message(chat_id, local_id, sent.id),
+        Err(e) => log::error!("TGAdapter send_message error: {e}"),
+    }
+}
+
+async fn send_file(
+    bot: &Bot,
+    chat_id: i64,
+    source: FileSource,
+    file_name: Option<String>,
+    file_id: Option<String>,
+    caption: Option<FormattedPayload>,
+    reply_to: Option<&str>,
+    local_id: Option<&str>,
+) {
+    let input = match input_file_from_source(source, file_name, file_id) {
+        Ok(input) => input,
+        Err(e) => {
+            log::error!("TGAdapter cannot prepare file: {e:#}");
+            return;
+        }
+    };
+
+    let mut req = bot.send_document(ChatId(chat_id), input);
+    if let Some(caption) = caption {
+        if let Some(parse_mode) = caption.format.map(parse_mode_from_format) {
+            req = req.parse_mode(parse_mode);
+        }
+        req = req.caption(caption.text);
+    }
+    if let Some(reply) = reply_parameters(reply_to) {
+        req = req.reply_parameters(reply);
+    }
+    match req.await {
+        Ok(sent) => record_sent_message(chat_id, local_id, sent.id),
+        Err(e) => log::error!("TGAdapter send_document error: {e}"),
+    }
+}
+
+async fn send_image(
+    bot: &Bot,
+    chat_id: i64,
+    source: ImageSource,
+    file_id: Option<String>,
+    caption: Option<FormattedPayload>,
+    reply_to: Option<&str>,
+    local_id: Option<&str>,
+) {
+    let input = match input_file_from_image(source, file_id) {
+        Ok(input) => input,
+        Err(e) => {
+            log::error!("TGAdapter cannot prepare image: {e:#}");
+            return;
+        }
+    };
+
+    let mut req = bot.send_photo(ChatId(chat_id), input);
+    if let Some(caption) = caption {
+        if let Some(parse_mode) = caption.format.map(parse_mode_from_format) {
+            req = req.parse_mode(parse_mode);
+        }
+        req = req.caption(caption.text);
+    }
+    if let Some(reply) = reply_parameters(reply_to) {
+        req = req.reply_parameters(reply);
+    }
+    match req.await {
+        Ok(sent) => record_sent_message(chat_id, local_id, sent.id),
+        Err(e) => log::error!("TGAdapter send_photo error: {e}"),
+    }
+}
+
+async fn send_file_media_groups(
+    bot: &Bot,
+    chat_id: i64,
+    files: Vec<ContentItem>,
+    mut caption: Option<FormattedPayload>,
+    reply_to: Option<&str>,
+    local_id: Option<&str>,
+) {
+    let mut chunk = Vec::new();
+    for file in files {
+        chunk.push(file);
+        if chunk.len() == 10 {
+            let chunk_caption = caption.take();
+            send_file_media_group(
+                bot,
+                chat_id,
+                std::mem::take(&mut chunk),
+                chunk_caption,
+                reply_to,
+                local_id,
+            )
+            .await;
+        }
+    }
+
+    if !chunk.is_empty() {
+        send_file_media_group(bot, chat_id, chunk, caption, reply_to, local_id).await;
+    }
+}
+
+async fn send_file_media_group(
+    bot: &Bot,
+    chat_id: i64,
+    files: Vec<ContentItem>,
+    caption: Option<FormattedPayload>,
+    reply_to: Option<&str>,
+    local_id: Option<&str>,
+) {
+    if files.len() == 1 {
+        if let Some(ContentItem::File {
+            source,
+            file_name,
+            file_id,
+        }) = files.into_iter().next()
+        {
+            send_file(
+                bot, chat_id, source, file_name, file_id, caption, reply_to, local_id,
+            )
+            .await;
+        }
+        return;
+    }
+
+    let last_index = files.len() - 1;
+    let mut media = Vec::with_capacity(files.len());
+    for (idx, file) in files.into_iter().enumerate() {
+        let ContentItem::File {
+            source,
+            file_name,
+            file_id,
+        } = file
+        else {
+            unreachable!();
+        };
+        let input = match input_file_from_source(source, file_name, file_id) {
+            Ok(input) => input,
+            Err(e) => {
+                log::error!("TGAdapter cannot prepare file: {e:#}");
+                return;
+            }
+        };
+        let mut document = InputMediaDocument::new(input);
+        if idx == last_index
+            && let Some(caption) = caption.clone()
+        {
+            if let Some(parse_mode) = caption.format.map(parse_mode_from_format) {
+                document = document.parse_mode(parse_mode);
+            }
+            document = document.caption(caption.text);
+        }
+        media.push(InputMedia::Document(document));
+    }
+
+    let mut req = bot.send_media_group(ChatId(chat_id), media);
+    if let Some(reply) = reply_parameters(reply_to) {
+        req = req.reply_parameters(reply);
+    }
+    match req.await {
+        Ok(sent) => {
+            if let Some(first) = sent.first() {
+                record_sent_message(chat_id, local_id, first.id);
+            }
+        }
+        Err(e) => log::error!("TGAdapter send_media_group error: {e}"),
+    }
+}
+
+async fn delete_message_item(bot: Bot, chat_id: i64, msg: Message) {
+    let Some(message_id) = msg.id else {
+        log::error!("TGAdapter delete_message missing message.id");
+        return;
+    };
+
+    let Some(message_id) = resolve_message_id(chat_id, &message_id).await else {
+        log::error!("TGAdapter cannot resolve message id for deletion: {message_id}");
+        return;
+    };
+
+    if let Err(e) = bot.delete_message(ChatId(chat_id), message_id).await {
+        log::error!("TGAdapter delete_message error: {e}");
+    }
+}
+
+async fn resolve_message_id(chat_id: i64, message_id: &str) -> Option<MessageId> {
+    for _ in 0..10 {
+        if let Some(id) = SENT_MESSAGES
+            .read()
+            .unwrap()
+            .get(&(chat_id, message_id.to_string()))
+            .copied()
+        {
+            return Some(id);
+        }
+        if let Ok(id) = message_id.parse::<i32>() {
+            return Some(MessageId(id));
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+    }
+    None
+}
+
+fn record_sent_message(chat_id: i64, local_id: Option<&str>, message_id: MessageId) {
+    if let Some(local_id) = local_id.filter(|id| !id.is_empty()) {
+        SENT_MESSAGES
+            .write()
+            .unwrap()
+            .insert((chat_id, local_id.to_string()), message_id);
+    }
+}
+
+fn merge_captions(
+    first: Option<FormattedPayload>,
+    second: Option<String>,
+) -> Option<FormattedPayload> {
+    match (first, second.filter(|s| !s.is_empty())) {
+        (Some(first), Some(second)) if first.text == second => Some(first),
+        (Some(mut first), Some(second)) => {
+            first.text.push('\n');
+            first.text.push_str(&second);
+            first.format = None;
+            Some(first)
+        }
+        (Some(first), None) => Some(first),
+        (None, Some(second)) => Some(FormattedPayload {
+            text: second,
+            format: None,
+        }),
+        (None, None) => None,
+    }
+}
+
+#[allow(deprecated)]
+fn parse_mode_from_format(format: TextFormat) -> ParseMode {
+    match format {
+        TextFormat::Markdown => ParseMode::Markdown,
+        TextFormat::MarkdownV2 => ParseMode::MarkdownV2,
+        TextFormat::Html => ParseMode::Html,
     }
 }
 
@@ -456,7 +807,7 @@ fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Ev
     let mut content = if text.is_empty() {
         vec![]
     } else {
-        vec![ContentItem::Text(text.to_string())]
+        vec![ContentItem::text(text)]
     };
     content.extend(convert_attachments(msg));
 
