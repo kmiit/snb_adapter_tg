@@ -4,10 +4,10 @@
 //! updates into [`Event`](snb_core::event::Event)s. Requires a bot token
 //! configured in `configs/TGAdapter/config.toml`.
 
-use std::collections::HashMap;
 use std::future::Future;
 use std::path::Path;
-use std::sync::{Arc, LazyLock, RwLock};
+use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use anyhow::Context as _;
 use base64::{Engine as _, engine::general_purpose};
@@ -43,9 +43,6 @@ bot_token = "YOUR_BOT_TOKEN_HERE"
 // `RwLock<Option<_>>` (not `OnceLock`) so `on_unload` can reset it for reloads.
 static CONFIG: RwLock<Option<Config>> = RwLock::new(None);
 static TG_BOT: RwLock<Option<Bot>> = RwLock::new(None);
-static SENT_MESSAGES: LazyLock<RwLock<HashMap<(i64, String), MessageId>>> =
-    LazyLock::new(|| RwLock::new(HashMap::new()));
-
 #[plugin]
 struct TGAdapter;
 
@@ -190,11 +187,12 @@ impl Adapter for TelegramAdapter {
             .cloned()
             .context("TGAdapter bot not initialized")?;
         let event_type = event.event_type.clone();
+        let origin = event.source.clone();
         let msg = msg.clone();
 
         spawn_send_task(async move {
             match event_type {
-                EventType::Message => send_message_items(bot, chat_id, msg).await,
+                EventType::Message => send_message_items(bot, chat_id, msg, origin).await,
                 EventType::MessageDelete => delete_message_item(bot, chat_id, msg).await,
                 kind => log::debug!("TGAdapter ignored outgoing event type: {kind:?}"),
             }
@@ -221,9 +219,10 @@ where
     }
 }
 
-async fn send_message_items(bot: Bot, chat_id: i64, msg: Message) {
-    let local_id = msg.id;
+async fn send_message_items(bot: Bot, chat_id: i64, msg: Message, origin: String) {
+    let local_id = msg.id.clone();
     let reply_to = msg.reply_to;
+    let delete_after = msg.delete_after;
     let mut text = OutgoingText::default();
     let mut attachments = Vec::new();
 
@@ -241,17 +240,18 @@ async fn send_message_items(bot: Bot, chat_id: i64, msg: Message) {
     }
 
     let caption = text.into_payload();
+    let mut sent_ids = Vec::new();
     if attachments.is_empty() {
         if let Some(text) = caption {
-            send_text(
-                &bot,
-                chat_id,
-                text,
-                reply_to.as_deref(),
-                local_id.as_deref(),
-            )
-            .await;
+            sent_ids
+                .extend(send_text(&bot, chat_id, text, reply_to.as_deref(), delete_after).await);
         }
+        emit_message_sent_if_needed(
+            &origin,
+            chat_id,
+            local_id.as_deref(),
+            sent_ids.first().copied(),
+        );
         return;
     }
 
@@ -260,15 +260,23 @@ async fn send_message_items(bot: Bot, chat_id: i64, msg: Message) {
             .iter()
             .all(|item| matches!(item, ContentItem::File { .. }))
     {
-        send_file_media_groups(
-            &bot,
+        sent_ids.extend(
+            send_file_media_groups(
+                &bot,
+                chat_id,
+                attachments,
+                caption,
+                reply_to.as_deref(),
+                delete_after,
+            )
+            .await,
+        );
+        emit_message_sent_if_needed(
+            &origin,
             chat_id,
-            attachments,
-            caption,
-            reply_to.as_deref(),
             local_id.as_deref(),
-        )
-        .await;
+            sent_ids.first().copied(),
+        );
         return;
     }
 
@@ -280,17 +288,19 @@ async fn send_message_items(bot: Bot, chat_id: i64, msg: Message) {
                 file_name,
                 file_id,
             } => {
-                send_file(
-                    &bot,
-                    chat_id,
-                    source,
-                    file_name,
-                    file_id,
-                    first_caption.take(),
-                    reply_to.as_deref(),
-                    local_id.as_deref(),
-                )
-                .await;
+                sent_ids.extend(
+                    send_file(
+                        &bot,
+                        chat_id,
+                        source,
+                        file_name,
+                        file_id,
+                        first_caption.take(),
+                        reply_to.as_deref(),
+                        delete_after,
+                    )
+                    .await,
+                );
             }
             ContentItem::Image {
                 source,
@@ -298,20 +308,29 @@ async fn send_message_items(bot: Bot, chat_id: i64, msg: Message) {
                 caption,
             } => {
                 let caption = merge_captions(first_caption.take(), caption);
-                send_image(
-                    &bot,
-                    chat_id,
-                    source,
-                    file_id,
-                    caption,
-                    reply_to.as_deref(),
-                    local_id.as_deref(),
-                )
-                .await;
+                sent_ids.extend(
+                    send_image(
+                        &bot,
+                        chat_id,
+                        source,
+                        file_id,
+                        caption,
+                        reply_to.as_deref(),
+                        delete_after,
+                    )
+                    .await,
+                );
             }
             ContentItem::Text { .. } | ContentItem::Other { .. } => unreachable!(),
         }
     }
+
+    emit_message_sent_if_needed(
+        &origin,
+        chat_id,
+        local_id.as_deref(),
+        sent_ids.first().copied(),
+    );
 }
 
 #[derive(Default)]
@@ -375,8 +394,8 @@ async fn send_text(
     chat_id: i64,
     text: FormattedPayload,
     reply_to: Option<&str>,
-    local_id: Option<&str>,
-) {
+    delete_after: Option<Duration>,
+) -> Vec<MessageId> {
     let mut req = bot.send_message(ChatId(chat_id), text.text);
     if let Some(parse_mode) = text.format.map(parse_mode_from_format) {
         req = req.parse_mode(parse_mode);
@@ -385,8 +404,14 @@ async fn send_text(
         req = req.reply_parameters(reply);
     }
     match req.await {
-        Ok(sent) => record_sent_message(chat_id, local_id, sent.id),
-        Err(e) => log::error!("TGAdapter send_message error: {e}"),
+        Ok(sent) => {
+            schedule_delete_after(bot, chat_id, sent.id, delete_after);
+            vec![sent.id]
+        }
+        Err(e) => {
+            log::error!("TGAdapter send_message error: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -398,13 +423,13 @@ async fn send_file(
     file_id: Option<String>,
     caption: Option<FormattedPayload>,
     reply_to: Option<&str>,
-    local_id: Option<&str>,
-) {
+    delete_after: Option<Duration>,
+) -> Vec<MessageId> {
     let input = match input_file_from_source(source, file_name, file_id) {
         Ok(input) => input,
         Err(e) => {
             log::error!("TGAdapter cannot prepare file: {e:#}");
-            return;
+            return Vec::new();
         }
     };
 
@@ -419,8 +444,14 @@ async fn send_file(
         req = req.reply_parameters(reply);
     }
     match req.await {
-        Ok(sent) => record_sent_message(chat_id, local_id, sent.id),
-        Err(e) => log::error!("TGAdapter send_document error: {e}"),
+        Ok(sent) => {
+            schedule_delete_after(bot, chat_id, sent.id, delete_after);
+            vec![sent.id]
+        }
+        Err(e) => {
+            log::error!("TGAdapter send_document error: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -431,13 +462,13 @@ async fn send_image(
     file_id: Option<String>,
     caption: Option<FormattedPayload>,
     reply_to: Option<&str>,
-    local_id: Option<&str>,
-) {
+    delete_after: Option<Duration>,
+) -> Vec<MessageId> {
     let input = match input_file_from_image(source, file_id) {
         Ok(input) => input,
         Err(e) => {
             log::error!("TGAdapter cannot prepare image: {e:#}");
-            return;
+            return Vec::new();
         }
     };
 
@@ -452,8 +483,14 @@ async fn send_image(
         req = req.reply_parameters(reply);
     }
     match req.await {
-        Ok(sent) => record_sent_message(chat_id, local_id, sent.id),
-        Err(e) => log::error!("TGAdapter send_photo error: {e}"),
+        Ok(sent) => {
+            schedule_delete_after(bot, chat_id, sent.id, delete_after);
+            vec![sent.id]
+        }
+        Err(e) => {
+            log::error!("TGAdapter send_photo error: {e}");
+            Vec::new()
+        }
     }
 }
 
@@ -463,28 +500,35 @@ async fn send_file_media_groups(
     files: Vec<ContentItem>,
     mut caption: Option<FormattedPayload>,
     reply_to: Option<&str>,
-    local_id: Option<&str>,
-) {
+    delete_after: Option<Duration>,
+) -> Vec<MessageId> {
+    let mut sent_ids = Vec::new();
     let mut chunk = Vec::new();
     for file in files {
         chunk.push(file);
         if chunk.len() == 10 {
             let chunk_caption = caption.take();
-            send_file_media_group(
-                bot,
-                chat_id,
-                std::mem::take(&mut chunk),
-                chunk_caption,
-                reply_to,
-                local_id,
-            )
-            .await;
+            sent_ids.extend(
+                send_file_media_group(
+                    bot,
+                    chat_id,
+                    std::mem::take(&mut chunk),
+                    chunk_caption,
+                    reply_to,
+                    delete_after,
+                )
+                .await,
+            );
         }
     }
 
     if !chunk.is_empty() {
-        send_file_media_group(bot, chat_id, chunk, caption, reply_to, local_id).await;
+        sent_ids.extend(
+            send_file_media_group(bot, chat_id, chunk, caption, reply_to, delete_after).await,
+        );
     }
+
+    sent_ids
 }
 
 async fn send_file_media_group(
@@ -493,8 +537,8 @@ async fn send_file_media_group(
     files: Vec<ContentItem>,
     caption: Option<FormattedPayload>,
     reply_to: Option<&str>,
-    local_id: Option<&str>,
-) {
+    delete_after: Option<Duration>,
+) -> Vec<MessageId> {
     if files.len() == 1 {
         if let Some(ContentItem::File {
             source,
@@ -502,12 +546,19 @@ async fn send_file_media_group(
             file_id,
         }) = files.into_iter().next()
         {
-            send_file(
-                bot, chat_id, source, file_name, file_id, caption, reply_to, local_id,
+            return send_file(
+                bot,
+                chat_id,
+                source,
+                file_name,
+                file_id,
+                caption,
+                reply_to,
+                delete_after,
             )
             .await;
         }
-        return;
+        return Vec::new();
     }
 
     let last_index = files.len() - 1;
@@ -525,7 +576,7 @@ async fn send_file_media_group(
             Ok(input) => input,
             Err(e) => {
                 log::error!("TGAdapter cannot prepare file: {e:#}");
-                return;
+                return Vec::new();
             }
         };
         let mut document = InputMediaDocument::new(input);
@@ -545,13 +596,40 @@ async fn send_file_media_group(
         req = req.reply_parameters(reply);
     }
     match req.await {
-        Ok(sent) => {
-            if let Some(first) = sent.first() {
-                record_sent_message(chat_id, local_id, first.id);
-            }
+        Ok(sent) => sent
+            .into_iter()
+            .map(|sent_message| {
+                schedule_delete_after(bot, chat_id, sent_message.id, delete_after);
+                sent_message.id
+            })
+            .collect(),
+        Err(e) => {
+            log::error!("TGAdapter send_media_group error: {e}");
+            Vec::new()
         }
-        Err(e) => log::error!("TGAdapter send_media_group error: {e}"),
     }
+}
+
+fn emit_message_sent_if_needed(
+    origin: &str,
+    chat_id: i64,
+    local_id: Option<&str>,
+    message_id: Option<MessageId>,
+) {
+    let (Some(local_id), Some(message_id)) = (local_id, message_id) else {
+        return;
+    };
+
+    let mut event = Event::message_sent(
+        "TGAdapter",
+        message_id.0.to_string(),
+        Some(local_id.to_string()),
+    );
+    if let Some(msg) = event.message.as_mut() {
+        msg.to = Some(chat_id.to_string());
+    }
+    event.receiver = Some(origin.to_string());
+    context::bot().emit_event(event);
 }
 
 async fn delete_message_item(bot: Bot, chat_id: i64, msg: Message) {
@@ -560,41 +638,31 @@ async fn delete_message_item(bot: Bot, chat_id: i64, msg: Message) {
         return;
     };
 
-    let Some(message_id) = resolve_message_id(chat_id, &message_id).await else {
-        log::error!("TGAdapter cannot resolve message id for deletion: {message_id}");
+    let Ok(message_id) = message_id.parse::<i32>() else {
+        log::error!("TGAdapter delete_message requires native Telegram message id: {message_id}");
         return;
     };
 
-    if let Err(e) = bot.delete_message(ChatId(chat_id), message_id).await {
+    if let Err(e) = bot
+        .delete_message(ChatId(chat_id), MessageId(message_id))
+        .await
+    {
         log::error!("TGAdapter delete_message error: {e}");
     }
 }
 
-async fn resolve_message_id(chat_id: i64, message_id: &str) -> Option<MessageId> {
-    for _ in 0..10 {
-        if let Some(id) = SENT_MESSAGES
-            .read()
-            .unwrap()
-            .get(&(chat_id, message_id.to_string()))
-            .copied()
-        {
-            return Some(id);
-        }
-        if let Ok(id) = message_id.parse::<i32>() {
-            return Some(MessageId(id));
-        }
-        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-    }
-    None
-}
+fn schedule_delete_after(bot: &Bot, chat_id: i64, message_id: MessageId, delay: Option<Duration>) {
+    let Some(delay) = delay else {
+        return;
+    };
 
-fn record_sent_message(chat_id: i64, local_id: Option<&str>, message_id: MessageId) {
-    if let Some(local_id) = local_id.filter(|id| !id.is_empty()) {
-        SENT_MESSAGES
-            .write()
-            .unwrap()
-            .insert((chat_id, local_id.to_string()), message_id);
-    }
+    let bot = bot.clone();
+    spawn_send_task(async move {
+        tokio::time::sleep(delay).await;
+        if let Err(e) = bot.delete_message(ChatId(chat_id), message_id).await {
+            log::warn!("TGAdapter delete_after delete_message error: {e}");
+        }
+    });
 }
 
 fn merge_captions(
@@ -872,6 +940,7 @@ fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Ev
         to: Some(chat_id),
         at,
         chat_type: Some(chat_type),
+        delete_after: None,
     };
 
     let kind_name = match &update.kind {
