@@ -64,9 +64,9 @@ impl SnbPlugin for TGAdapter {
     }
     fn on_load(&mut self, ctx: Arc<dyn BotContext>) {
         context::set_bot(ctx);
-        let config_path = Path::new("TGAdapter/config.toml");
+        context::set_plugin(self.name());
 
-        match context::bot().load_config(config_path) {
+        match context::plugin().load_config(Path::new("config.toml")) {
             Ok(content) => match toml::from_str::<Config>(&content) {
                 Ok(config) => {
                     *CONFIG.write().unwrap() = Some(config);
@@ -76,11 +76,7 @@ impl SnbPlugin for TGAdapter {
                 }
             },
             Err(_) => {
-                if let Err(e) = context::bot().write_config(
-                    self.name(),
-                    Path::new("config.toml"),
-                    DEFAULT_CONFIG,
-                ) {
+                if let Err(e) = context::plugin().write_config(Path::new("config.toml"), DEFAULT_CONFIG) {
                     log::error!("failed to write default config: {e}");
                 }
                 log::warn!(
