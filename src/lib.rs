@@ -193,6 +193,7 @@ impl Adapter for TelegramAdapter {
         spawn_send_task(async move {
             match event_type {
                 EventType::Message => send_message_items(bot, chat_id, msg, origin).await,
+                EventType::MessageEdit => edit_message_item(bot, chat_id, msg).await,
                 EventType::MessageDelete => delete_message_item(bot, chat_id, msg).await,
                 kind => log::debug!("TGAdapter ignored outgoing event type: {kind:?}"),
             }
@@ -630,6 +631,42 @@ fn emit_message_sent_if_needed(
     }
     event.receiver = Some(origin.to_string());
     context::bot().emit_event(event);
+}
+
+async fn edit_message_item(bot: Bot, chat_id: i64, msg: Message) {
+    let Some(message_id) = msg.id.as_deref() else {
+        log::error!("TGAdapter edit_message missing message.id");
+        return;
+    };
+    let Ok(message_id) = message_id.parse::<i32>() else {
+        log::error!("TGAdapter edit_message requires native Telegram message id: {message_id}");
+        return;
+    };
+
+    let mut text = OutgoingText::default();
+    for item in &msg.content {
+        if let ContentItem::Text {
+            text: item_text,
+            format,
+        } = item
+        {
+            text.push_text(item_text.clone(), *format);
+        }
+    }
+    let Some(payload) = text.into_payload() else {
+        log::error!("TGAdapter edit_message has no text content");
+        return;
+    };
+
+    let mut req = bot.edit_message_text(ChatId(chat_id), MessageId(message_id), payload.text);
+    if let Some(parse_mode) = payload.format.map(parse_mode_from_format) {
+        req = req.parse_mode(parse_mode);
+    }
+    if let Err(e) = req.await {
+        // Telegram returns an error when the new text is identical to the old
+        // one; that is harmless for status updates, so only warn.
+        log::warn!("TGAdapter edit_message error: {e}");
+    }
 }
 
 async fn delete_message_item(bot: Bot, chat_id: i64, msg: Message) {
