@@ -28,7 +28,6 @@ use teloxide::types::{
 #[derive(Deserialize)]
 struct Config {
     bot_token: String,
-    #[allow(dead_code)]
     api_url: Option<String>,
 }
 
@@ -101,15 +100,26 @@ impl SnbPlugin for TGAdapter {
 }
 
 async fn tg_dispatcher(bot: Arc<dyn BotContext>) {
-    let token = match CONFIG.read().unwrap().as_ref() {
-        Some(config) => config.bot_token.clone(),
+    let (token, api_url) = match CONFIG.read().unwrap().as_ref() {
+        Some(config) => (config.bot_token.clone(), config.api_url.clone()),
         None => {
             log::error!("bot_token not configured, adapter not starting");
             return;
         }
     };
 
-    let tg_bot = Bot::new(token);
+    let mut tg_bot = Bot::new(token);
+    if let Some(api_url) = api_url.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+        match url::Url::parse(api_url) {
+            Ok(url) => {
+                log::info!("using custom Telegram API URL: {api_url}");
+                tg_bot = tg_bot.set_api_url(url);
+            }
+            Err(e) => {
+                log::error!("invalid api_url {api_url:?}: {e}; falling back to default");
+            }
+        }
+    }
     *TG_BOT.write().unwrap() = Some(tg_bot.clone());
 
     log::info!("start Telegram dispatcher");
