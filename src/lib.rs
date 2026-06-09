@@ -29,11 +29,36 @@ use teloxide::types::{
 struct Config {
     bot_token: String,
     api_url: Option<String>,
+    #[serde(default, alias = "admin_users", alias = "admin_user_ids")]
+    admins: Vec<AdminId>,
+}
+
+#[derive(Deserialize)]
+#[serde(untagged)]
+enum AdminId {
+    String(String),
+    Integer(i64),
+}
+
+impl Config {
+    fn is_admin(&self, user_id: &str) -> bool {
+        self.admins.iter().any(|admin| admin.matches(user_id))
+    }
+}
+
+impl AdminId {
+    fn matches(&self, user_id: &str) -> bool {
+        match self {
+            Self::String(id) => id == user_id,
+            Self::Integer(id) => id.to_string() == user_id,
+        }
+    }
 }
 
 const DEFAULT_CONFIG: &str = r#"# Telegram Adapter Configuration
 bot_token = "YOUR_BOT_TOKEN_HERE"
 # api_url = "https://api.telegram.org"
+admins = []
 "#;
 
 // Plugin-wide state. Each plugin is a singleton (one cdylib, one instance), so
@@ -76,7 +101,9 @@ impl SnbPlugin for TGAdapter {
                 }
             },
             Err(_) => {
-                if let Err(e) = context::plugin().write_config(Path::new("config.toml"), DEFAULT_CONFIG) {
+                if let Err(e) =
+                    context::plugin().write_config(Path::new("config.toml"), DEFAULT_CONFIG)
+                {
                     log::error!("failed to write default config: {e}");
                 }
                 log::warn!(
@@ -806,6 +833,17 @@ fn non_empty(value: Option<String>) -> Option<String> {
     value.filter(|value| !value.is_empty())
 }
 
+fn is_configured_admin(user_id: Option<&str>) -> bool {
+    let Some(user_id) = user_id else {
+        return false;
+    };
+    CONFIG
+        .read()
+        .unwrap()
+        .as_ref()
+        .is_some_and(|config| config.is_admin(user_id))
+}
+
 fn convert_update(update: &Update) -> Option<Event> {
     match &update.kind {
         UpdateKind::Message(msg)
@@ -974,6 +1012,7 @@ fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Ev
 
     let id = Some(msg.id.0.to_string());
     let reply_to = msg.reply_to_message().map(|m| m.id.0.to_string());
+    let is_admin = is_configured_admin(from.as_deref());
 
     let event_msg = Message {
         id,
@@ -983,6 +1022,7 @@ fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Ev
         to: Some(chat_id),
         at,
         chat_type: Some(chat_type),
+        is_admin,
         delete_after: None,
     };
 
@@ -1014,4 +1054,24 @@ fn convert_message(update: &Update, msg: &teloxide::types::Message) -> Option<Ev
         sender: Some("TGAdapter".to_string()),
         receiver: None,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn config_accepts_string_and_numeric_admin_ids() {
+        let config: Config = toml::from_str(
+            r#"
+bot_token = "token"
+admins = ["42", 77]
+"#,
+        )
+        .unwrap();
+
+        assert!(config.is_admin("42"));
+        assert!(config.is_admin("77"));
+        assert!(!config.is_admin("11"));
+    }
 }
